@@ -473,6 +473,3 @@ If ARRANGE helps you, please:
 
 **Happy organizing! 📁✨**
 
-git add .
-git commit -m "Test auto-build"
-git push origin Index
