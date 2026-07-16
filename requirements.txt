@@ -1,0 +1,4 @@
+# No external dependencies required for file_organizer.py
+# Uses only Python standard library
+
+# Python 3.6+
