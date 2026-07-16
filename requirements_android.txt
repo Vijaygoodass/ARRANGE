@@ -1,0 +1,12 @@
+# Requirements for building Android APK
+# Install: pip install -r requirements_android.txt
+
+buildozer==1.4.4
+cython==0.29.32
+kivy==2.2.1
+kivy-garden==0.1.5
+python-for-android==2023.06.06
+
+# Additional dependencies
+ccache==4.8
+openjdk==11.0.0
