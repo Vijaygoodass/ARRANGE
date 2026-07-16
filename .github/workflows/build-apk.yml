@@ -10,15 +10,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    steps:
-      # ... (your checkout, JDK setup, and flutter/gradle build steps will be here) ...
-
-      - name: Upload Build Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: my-artifact
-          path: dist/                # Ensure this matches your actual APK output path (e.g., build/app/outputs/flutter-apk/)
-          if-no-files-found: warn    # <-- Add this line here
+    
     steps:
     - uses: actions/checkout@v4
     
