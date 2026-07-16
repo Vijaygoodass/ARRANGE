@@ -1,15 +1,34 @@
 #!/usr/bin/env python3
 """
-File Organizer Application
+File Organizer Application - Background Scheduler
 Automatically sorts and moves files into folders based on their file type
 Creates subfolders for each specific format within main categories
-Comprehensive extension support for all major file types
+Runs in background and organizes files once per day
 """
 
 import os
 import shutil
+import time
+import sys
+import signal
+import logging
 from pathlib import Path
 from collections import defaultdict
+from datetime import datetime, timedelta
+from threading import Thread
+import json
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('file_organizer.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 
 # File extension to subfolder mapping (Category -> Subfolder -> Extensions)
@@ -183,7 +202,7 @@ FILE_CATEGORIES = {
         'LaTeX': ['.tex', '.latex', '.ltx', '.aux', '.bbl', '.bib'],
         'ReStructuredText': ['.rst', '.rest'],
         'AsciiDoc': ['.adoc', '.asciidoc'],
-        'Other Docs': ['.log', '.dat', '.dat', '.msg', '.eml'],
+        'Other Docs': ['.log', '.dat', '.msg', '.eml'],
     },
 }
 
@@ -236,13 +255,17 @@ class FileOrganizer:
         file_stats = defaultdict(lambda: defaultdict(int))
         
         # Get all files in the directory (non-recursive)
-        files = [f for f in self.source_dir.iterdir() if f.is_file()]
-        
-        if not files:
-            print(f"No files found in {self.source_dir}")
+        try:
+            files = [f for f in self.source_dir.iterdir() if f.is_file()]
+        except PermissionError:
+            logger.error(f"Permission denied accessing {self.source_dir}")
             return
         
-        print(f"Found {len(files)} file(s) to organize\n")
+        if not files:
+            logger.info(f"No files found in {self.source_dir}")
+            return
+        
+        logger.info(f"Found {len(files)} file(s) to organize")
         
         for file_path in files:
             file_extension = file_path.suffix
@@ -259,134 +282,306 @@ class FileOrganizer:
                 destination_display = category
             
             if not target_folder.exists() and not dry_run:
-                target_folder.mkdir(parents=True, exist_ok=True)
-                if subfolder:
-                    print(f"✓ Created folder: {destination_display}/")
+                try:
+                    target_folder.mkdir(parents=True, exist_ok=True)
+                    logger.info(f"✓ Created folder: {destination_display}/")
+                except PermissionError:
+                    logger.error(f"Permission denied creating {destination_display}/")
+                    continue
             
             # Move file to target folder
             destination = target_folder / file_path.name
             
             if dry_run:
-                print(f"[DRY RUN] Would move: {file_path.name} → {destination_display}/")
+                logger.info(f"[DRY RUN] Would move: {file_path.name} → {destination_display}/")
             else:
                 if destination.exists():
-                    print(f"⚠ File already exists: {destination_display}/{file_path.name} (skipping)")
+                    logger.warning(f"⚠ File already exists: {destination_display}/{file_path.name} (skipping)")
                 else:
-                    shutil.move(str(file_path), str(destination))
-                    print(f"✓ Moved: {file_path.name} → {destination_display}/")
+                    try:
+                        shutil.move(str(file_path), str(destination))
+                        logger.info(f"✓ Moved: {file_path.name} → {destination_display}/")
+                    except (PermissionError, shutil.Error) as e:
+                        logger.error(f"Error moving {file_path.name}: {e}")
+                        continue
             
             file_stats[category][subfolder] += 1
         
-        print("\n" + "="*80)
-        print("ORGANIZATION SUMMARY")
-        print("="*80)
+        logger.info("="*80)
+        logger.info("ORGANIZATION SUMMARY")
+        logger.info("="*80)
         
         total_files = sum(sum(subf.values()) for subf in file_stats.values())
-        print(f"\nTotal files organized: {total_files}\n")
+        logger.info(f"Total files organized: {total_files}\n")
         
         for category in sorted(file_stats.keys()):
             total_in_category = sum(file_stats[category].values())
-            print(f"📁 {category} ({total_in_category} file(s)):")
+            logger.info(f"📁 {category} ({total_in_category} file(s)):")
             for subfolder, count in sorted(file_stats[category].items()):
                 if subfolder:
-                    print(f"   └─ {subfolder}: {count} file(s)")
+                    logger.info(f"   └─ {subfolder}: {count} file(s)")
                 else:
-                    print(f"   {count} file(s)")
+                    logger.info(f"   {count} file(s)")
         
-        print("\n" + "="*80)
+        logger.info("="*80)
+
+
+class ScheduledOrganizer:
+    """Manages scheduled file organization in background"""
     
-    def organize_recursive(self, dry_run=False):
-        """
-        Recursively organize files in subdirectories
+    CONFIG_FILE = 'organizer_config.json'
+    SCHEDULE_FILE = 'organizer_schedule.json'
+    
+    def __init__(self):
+        self.running = False
+        self.directories = []
+        self.interval_hours = 24  # Default: organize once per day
+        self.load_config()
+    
+    def load_config(self):
+        """Load configuration from file"""
+        if os.path.exists(self.CONFIG_FILE):
+            try:
+                with open(self.CONFIG_FILE, 'r') as f:
+                    config = json.load(f)
+                    self.directories = config.get('directories', [])
+                    self.interval_hours = config.get('interval_hours', 24)
+                    logger.info(f"Loaded config: {len(self.directories)} directories, interval: {self.interval_hours}h")
+            except Exception as e:
+                logger.error(f"Error loading config: {e}")
+        else:
+            logger.warning("Config file not found. Using default settings.")
+    
+    def save_config(self):
+        """Save configuration to file"""
+        config = {
+            'directories': self.directories,
+            'interval_hours': self.interval_hours,
+            'created_at': datetime.now().isoformat()
+        }
+        try:
+            with open(self.CONFIG_FILE, 'w') as f:
+                json.dump(config, f, indent=4)
+                logger.info(f"Config saved: {len(self.directories)} directories")
+        except Exception as e:
+            logger.error(f"Error saving config: {e}")
+    
+    def add_directory(self, directory_path):
+        """Add directory to organization list"""
+        directory_path = str(Path(directory_path).resolve())
+        if directory_path not in self.directories:
+            self.directories.append(directory_path)
+            self.save_config()
+            logger.info(f"Added directory: {directory_path}")
+            return True
+        return False
+    
+    def remove_directory(self, directory_path):
+        """Remove directory from organization list"""
+        directory_path = str(Path(directory_path).resolve())
+        if directory_path in self.directories:
+            self.directories.remove(directory_path)
+            self.save_config()
+            logger.info(f"Removed directory: {directory_path}")
+            return True
+        return False
+    
+    def organize_now(self):
+        """Organize all directories immediately"""
+        logger.info("Starting manual organization...")
+        for directory in self.directories:
+            if not os.path.exists(directory):
+                logger.warning(f"Directory not found: {directory}")
+                continue
+            
+            try:
+                organizer = FileOrganizer(directory)
+                organizer.organize_files(dry_run=False)
+            except Exception as e:
+                logger.error(f"Error organizing {directory}: {e}")
         
-        Args:
-            dry_run (bool): If True, show what would be moved without actually moving
-        """
-        for directory in self.source_dir.rglob('.'):
-            if directory.is_dir():
-                organizer = FileOrganizer(str(directory))
-                files_in_dir = [f for f in directory.iterdir() if f.is_file()]
+        self.update_last_run_time()
+    
+    def update_last_run_time(self):
+        """Update the last run time"""
+        schedule = {
+            'last_run': datetime.now().isoformat(),
+            'next_run': (datetime.now() + timedelta(hours=self.interval_hours)).isoformat()
+        }
+        try:
+            with open(self.SCHEDULE_FILE, 'w') as f:
+                json.dump(schedule, f, indent=4)
+        except Exception as e:
+            logger.error(f"Error updating schedule: {e}")
+    
+    def get_next_run_time(self):
+        """Get the next scheduled run time"""
+        if os.path.exists(self.SCHEDULE_FILE):
+            try:
+                with open(self.SCHEDULE_FILE, 'r') as f:
+                    schedule = json.load(f)
+                    return schedule.get('next_run', 'Unknown')
+            except Exception as e:
+                logger.error(f"Error reading schedule: {e}")
+        return 'Not scheduled'
+    
+    def scheduler_loop(self):
+        """Background scheduler loop"""
+        logger.info(f"Scheduler started - will organize every {self.interval_hours} hours")
+        
+        last_run = datetime.now() - timedelta(hours=self.interval_hours)  # Run immediately on start
+        
+        while self.running:
+            now = datetime.now()
+            time_since_last_run = (now - last_run).total_seconds() / 3600  # Convert to hours
+            
+            if time_since_last_run >= self.interval_hours:
+                logger.info(f"\n{'='*80}")
+                logger.info(f"🔄 Scheduled organization triggered at {now.strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.info(f"{'='*80}\n")
                 
-                if files_in_dir:
-                    print(f"\nOrganizing: {directory}")
-                    organizer.organize_files(dry_run=dry_run)
+                self.organize_now()
+                last_run = now
+                
+                next_run = now + timedelta(hours=self.interval_hours)
+                logger.info(f"\n✅ Next organization scheduled for: {next_run.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            
+            # Check every 60 seconds
+            time.sleep(60)
+    
+    def start_background(self):
+        """Start the scheduler in background thread"""
+        if self.running:
+            logger.warning("Scheduler is already running")
+            return False
+        
+        if not self.directories:
+            logger.error("No directories configured. Add directories first.")
+            return False
+        
+        self.running = True
+        scheduler_thread = Thread(target=self.scheduler_loop, daemon=True)
+        scheduler_thread.start()
+        logger.info("Background scheduler started")
+        return True
+    
+    def stop_background(self):
+        """Stop the background scheduler"""
+        self.running = False
+        logger.info("Background scheduler stopped")
 
 
-def print_categories():
-    """Print available categories and subfolders"""
-    print("\n" + "="*80)
-    print("SUPPORTED FILE TYPES - COMPREHENSIVE EXTENSION LIST")
-    print("="*80)
-    
-    total_extensions = 0
-    for category, subfolders in FILE_CATEGORIES.items():
-        if isinstance(subfolders, dict):
-            category_ext_count = sum(len(exts) for exts in subfolders.values())
-            total_extensions += category_ext_count
-    
-    print(f"\nTotal Categories: {len(FILE_CATEGORIES)}")
-    print(f"Total Extensions Supported: {total_extensions}\n")
-    
-    for category, subfolders in FILE_CATEGORIES.items():
-        total_in_category = sum(len(exts) for exts in subfolders.values())
-        print(f"📁 {category}/ ({total_in_category} extensions)")
-        if isinstance(subfolders, dict):
-            items = list(subfolders.items())
-            for idx, (subfolder, extensions) in enumerate(items):
-                is_last = idx == len(items) - 1
-                prefix = "   └─ " if is_last else "   ├─ "
-                ext_list = ', '.join(extensions)
-                print(f"{prefix}{subfolder}: {ext_list}")
-        print()
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully"""
+    logger.info("\nShutdown signal received")
+    sys.exit(0)
+
+
+def interactive_menu(organizer):
+    """Interactive menu for user"""
+    while True:
+        print("\n" + "="*80)
+        print("FILE ORGANIZER - BACKGROUND SCHEDULER")
+        print("="*80)
+        print("\n1. Add directory to watch")
+        print("2. Remove directory from watch")
+        print("3. Set interval (hours)")
+        print("4. Start background scheduler")
+        print("5. Organize now")
+        print("6. View status")
+        print("7. Exit")
+        print("\nConfigured directories:")
+        for i, d in enumerate(organizer.directories, 1):
+            print(f"  {i}. {d}")
+        
+        choice = input("\nSelect option (1-7): ").strip()
+        
+        if choice == '1':
+            path = input("Enter directory path: ").strip()
+            if organizer.add_directory(path):
+                print(f"✓ Added: {path}")
+            else:
+                print(f"⚠ Directory already added")
+        
+        elif choice == '2':
+            if not organizer.directories:
+                print("No directories configured")
+                continue
+            path = input("Enter directory path to remove: ").strip()
+            if organizer.remove_directory(path):
+                print(f"✓ Removed: {path}")
+            else:
+                print(f"⚠ Directory not found")
+        
+        elif choice == '3':
+            try:
+                hours = int(input("Enter interval in hours (default 24): ").strip() or "24")
+                organizer.interval_hours = max(1, hours)
+                organizer.save_config()
+                print(f"✓ Interval set to {organizer.interval_hours} hours")
+            except ValueError:
+                print("Invalid input")
+        
+        elif choice == '4':
+            if organizer.start_background():
+                print("✓ Background scheduler started")
+                print("The app will now run in the background")
+            else:
+                print("⚠ Could not start scheduler")
+        
+        elif choice == '5':
+            print("\n🔄 Organizing now...")
+            organizer.organize_now()
+            print("✓ Organization complete")
+        
+        elif choice == '6':
+            print("\n" + "-"*80)
+            print("STATUS")
+            print("-"*80)
+            print(f"Running: {organizer.running}")
+            print(f"Interval: {organizer.interval_hours} hours")
+            print(f"Directories: {len(organizer.directories)}")
+            print(f"Next run: {organizer.get_next_run_time()}")
+            print("-"*80)
+        
+        elif choice == '7':
+            print("Exiting...")
+            break
+        
+        else:
+            print("Invalid option")
 
 
 def main():
     """Main entry point"""
-    import sys
+    signal.signal(signal.SIGINT, signal_handler)
     
-    print("=" * 80)
-    print("FILE ORGANIZER - PROFESSIONAL EDITION (COMPREHENSIVE)")
-    print("=" * 80)
-    print("\n✨ Organizes ALL file types into categorized subfolders by format")
-    print("🎯 Supports 200+ file extensions across 14 categories")
-    print("🔒 Smart organization with dry-run preview\n")
+    print("="*80)
+    print("FILE ORGANIZER - BACKGROUND SCHEDULER")
+    print("="*80)
+    print("\n✨ Professional file organization with background scheduling")
+    print("🔄 Organizes files once per day automatically")
+    print("📁 Supports 200+ file extensions\n")
     
-    print_categories()
+    organizer = ScheduledOrganizer()
     
-    # Get directory from user or use current directory
-    if len(sys.argv) > 1:
-        target_dir = sys.argv[1]
+    # If running as daemon/background (with --daemon flag)
+    if len(sys.argv) > 1 and sys.argv[1] == '--daemon':
+        if not organizer.directories:
+            print("Error: No directories configured. Configure first with --setup")
+            sys.exit(1)
+        
+        print("Starting in daemon mode...")
+        if organizer.start_background():
+            logger.info("Daemon started - running in background")
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                logger.info("Daemon stopped")
     else:
-        target_dir = input("Enter directory path (default: current directory): ").strip()
-        if not target_dir:
-            target_dir = "."
-    
-    try:
-        organizer = FileOrganizer(target_dir)
-        
-        # Ask for dry run
-        dry_run_input = input("\nRun in dry-run mode first? (y/n, default: y): ").strip().lower()
-        dry_run = dry_run_input != 'n'
-        
-        if dry_run:
-            print("\n[DRY RUN MODE] Preview of changes:\n")
-        
-        organizer.organize_files(dry_run=dry_run)
-        
-        if dry_run:
-            proceed = input("\nProceed with organizing files? (y/n): ").strip().lower()
-            if proceed == 'y':
-                print("\nExecuting organization...\n")
-                organizer.organize_files(dry_run=False)
-            else:
-                print("Operation cancelled.")
-    
-    except (FileNotFoundError, NotADirectoryError) as e:
-        print(f"Error: {e}")
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print("\nOperation cancelled by user.")
-        sys.exit(0)
+        # Interactive mode
+        interactive_menu(organizer)
 
 
 if __name__ == "__main__":
