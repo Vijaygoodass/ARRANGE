@@ -1,0 +1,73 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ Index, main, master ]
+  pull_request:
+    branches: [ Index, main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install buildozer cython kivy
+        pip install -r requirements_android.txt
+    
+    - name: Set up Java
+      uses: actions/setup-java@v3
+      with:
+        distribution: 'temurin'
+        java-version: '11'
+    
+    - name: Install Android SDK
+      run: |
+        mkdir -p $ANDROID_HOME
+        cd $ANDROID_HOME
+        wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
+        unzip -q commandlinetools-linux-9477386_latest.zip
+        rm commandlinetools-linux-9477386_latest.zip
+        yes | ./cmdline-tools/bin/sdkmanager --install "platforms;android-31" "build-tools;31.0.0" "ndk;25.1.8937393"
+      env:
+        ANDROID_HOME: /opt/android-sdk
+    
+    - name: Set Android environment variables
+      run: |
+        echo "ANDROID_HOME=/opt/android-sdk" >> $GITHUB_ENV
+        echo "ANDROID_SDK_ROOT=/opt/android-sdk" >> $GITHUB_ENV
+        echo "ANDROID_NDK_ROOT=/opt/android-sdk/ndk/25.1.8937393" >> $GITHUB_ENV
+        echo "/opt/android-sdk/cmdline-tools/bin" >> $GITHUB_PATH
+        echo "/opt/android-sdk/platform-tools" >> $GITHUB_PATH
+    
+    - name: Build APK
+      run: |
+        rm -rf .buildozer bin
+        buildozer android debug
+      timeout-minutes: 60
+    
+    - name: Upload APK to artifacts
+      uses: actions/upload-artifact@v3
+      if: success()
+      with:
+        name: arrange-debug-apk
+        path: bin/arrange-1.0-debug.apk
+        retention-days: 30
+    
+    - name: Create Release (on tag)
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: bin/arrange-1.0-debug.apk
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
